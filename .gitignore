@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Environment variables & secrets (極重要：防止金鑰外洩)
+.env
+.env.*
+!.env.example
+
+# Deployment artifacts
+.deploy_space/
+
+# Output & cache files
+output/
+.cache/
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# IDE & Editor configs
+.vscode/
+.idea/
+*.swp
+ 
