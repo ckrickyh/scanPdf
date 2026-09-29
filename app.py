@@ -20,6 +20,19 @@ try:
 except ImportError:
     from reranker import rerank_candidates, RerankerService
 
+try:
+    from nosql.mongo_client import get_mongo_db, init_indexes
+    from nosql.session_logger import log_chat_turn_async, log_search_audit_async
+    from nosql.analytics_pipeline import get_latency_analytics, get_top_queries
+    init_indexes()
+except Exception:
+    get_mongo_db = lambda: None
+    init_indexes = lambda: {}
+    log_chat_turn_async = lambda *a, **kw: None
+    log_search_audit_async = lambda *a, **kw: None
+    get_latency_analytics = lambda: []
+    get_top_queries = lambda limit=10: []
+
 
 # 取得配置參數
 TARGET = get_db_target()
@@ -191,6 +204,18 @@ def get_database_statistics() -> str:
     gemini_key = get_gemini_api_key()
     gemini_status = f"已啟用（{GEMINI_MODEL}）" if gemini_key else "未設定（僅檢索）"
 
+    # 檢查 MongoDB NoSQL 狀態
+    mongo_db = get_mongo_db()
+    if mongo_db is not None:
+        try:
+            sess_cnt = mongo_db["chat_sessions"].count_documents({})
+            log_cnt = mongo_db["search_audit_logs"].count_documents({})
+            nosql_status = f"連線正常（{sess_cnt} 個會話, {log_cnt} 筆日誌）"
+        except Exception:
+            nosql_status = "連線正常"
+    else:
+        nosql_status = "未連線（已自動安全降級，不影響主功能）"
+
     try:
         with psycopg.connect(conn_str, connect_timeout=5) as conn:
             with conn.cursor() as cur:
@@ -210,12 +235,14 @@ def get_database_statistics() -> str:
             f"- **純文字區塊**：`{texts}` 筆\n"
             f"- **表格區塊**：`{tables}` 筆\n"
             f"- **連線端點**：`{'Supabase Cloud (SSL 加密連線)' if target == 'supabase' else 'Localhost (本機連線)'}`\n"
+            f"- **NoSQL (MongoDB)**：`{nosql_status}`\n"
             f"- **Gemini 狀態**：`{gemini_status}`"
         )
     except Exception as e:
         return (
             f"**連線狀態**：連線異常\n"
             f"- **目標環境**：`{target.upper()}`\n"
+            f"- **NoSQL (MongoDB)**：`{nosql_status}`\n"
             f"- **原因**：{str(e)}\n"
             f"- **Gemini 狀態**：`{gemini_status}`"
         )
@@ -240,6 +267,8 @@ def perform_search(
     """執行雙路混合檢索（Vector + BM25 tsvector）、Cross-Encoder 重排與 Google Gemini 生成回答"""
     if not query.strip():
         return "請輸入有效查詢內容。", "無檢索結果。"
+
+    start_time = time.time()
 
     try:
         query_vec = get_query_embedding(query)
@@ -415,6 +444,34 @@ def perform_search(
             f"```text\n{content}\n```\n"
             f"---\n"
         )
+
+    # 4. 非同步寫入會話與稽核日誌至 MongoDB (NoSQL)
+    try:
+        total_ms = round((time.time() - start_time) * 1000, 2)
+        chunk_ids = [c["chunk_id"] for c in final_chunks]
+        top_scores = [
+            float(c.get("rerank_score") or c.get("rrf_score") or c.get("cosine_similarity") or 0.0)
+            for c in final_chunks[:3]
+        ]
+        log_chat_turn_async(
+            session_id="gradio_web_session",
+            user_id="web_user",
+            query=query,
+            response=llm_answer,
+            retrieved_chunk_ids=chunk_ids,
+            latency_ms=total_ms,
+        )
+        log_search_audit_async(
+            query=query,
+            session_id="gradio_web_session",
+            query_type="hybrid" if use_hybrid else "vector",
+            chunk_type_filter=chunk_type if chunk_type != "全部" else None,
+            total_latency_ms=total_ms,
+            result_count=len(final_chunks),
+            top_scores=top_scores,
+        )
+    except Exception:
+        pass
 
     chunks_md = "\n".join(md_output)
     return llm_answer, chunks_md
@@ -662,6 +719,47 @@ with gr.Blocks(title="PDF 語意切分檢索系統") as demo:
             with gr.Accordion("檢索參考切塊（Top-K 來源明細）", open=True):
                 output_chunks = gr.Markdown(
                     value="檢索到的參考切塊將展示於此處。"
+                )
+
+            with gr.Accordion("NoSQL (MongoDB) 運維分析與熱門查詢報表", open=False):
+                analytics_display = gr.Markdown(
+                    value="點擊下方按鈕以透過 MongoDB 聚合管線（Aggregation Pipeline）即時生成指標報表。"
+                )
+                analytics_btn = gr.Button("即時執行 MongoDB 聚合管線分析", size="sm")
+
+                def run_nosql_analytics_view() -> str:
+                    db = get_mongo_db()
+                    if db is None:
+                        return (
+                            "**NoSQL 狀態**：MongoDB 未連線，目前處於無感安全降級模式。\n\n"
+                            "提示：可於本機執行 `docker run -d -p 27017:27017 mongo:7` 或設定雲端 `MONGODB_URI`。"
+                        )
+                    lat_data = get_latency_analytics()
+                    top_q = get_top_queries(limit=5)
+
+                    md = ["### 【MongoDB 聚合管線即時分析報表】\n"]
+                    md.append("#### 1. 檢索模式平均延遲統計 (`$group` + `$avg`)")
+                    if lat_data:
+                        for row in lat_data:
+                            md.append(
+                                f"- **模式 `{row['_id']}`**：共 `{row['total_queries']}` 筆查詢，"
+                                f"平均耗時 `{row['avg_total_ms']}` ms（最高: `{row['max_total_ms']}` ms, 最低: `{row['min_total_ms']}` ms）"
+                            )
+                    else:
+                        md.append("- 尚無檢索稽核日誌資料。")
+
+                    md.append("\n#### 2. 熱門搜尋詞彙頻率 (`$group` + `$sort`)")
+                    if top_q:
+                        for q in top_q:
+                            md.append(f"- 「**{q['_id']}**」：查詢 `{q['frequency']}` 次，平均總延遲 `{q['avg_latency_ms']}` ms")
+                    else:
+                        md.append("- 尚無熱門搜尋紀錄。")
+                    return "\n".join(md)
+
+                analytics_btn.click(
+                    fn=run_nosql_analytics_view,
+                    inputs=[],
+                    outputs=analytics_display
                 )
 
     search_btn.click(

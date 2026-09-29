@@ -278,5 +278,104 @@ uv run evaluation/llm_judge.py \
 ## RAG External Knowledge Leakage Audit
 uv run evaluation/leakage_detector.py --query "感測器如何安裝在樹幹上？" --top-k 3
 
+## NoSQL（MongoDB）雙資料庫架構與選型邏輯
+
+### 1. 一句話白話定位
+* **PostgreSQL (Supabase)**：負責「**大腦核心檢索**」（手冊向量、文字切塊、關鍵字混合檢索）。要求嚴謹格式與極致計算精度。
+* **MongoDB (NoSQL)**：負責「**對話歷程與系統日誌**」（使用者問答會話、各階段檢索延遲日誌）。要求彈性結構、高頻追加寫入與自動過期清理。
+
+### 2. 生活通俗比喻
+* **PostgreSQL** 就像「**正式合約與精密病歷庫**」：每一頁格式都釘死，不可隨意塗改，適合存絕對不能出錯的手冊知識。
+* **MongoDB** 就像「**隨身活頁便利貼本**」：
+  * 每多聊一輪對話，就像往本子後面多貼一張便利貼（原生 `$push` 追加），不用整本重抄。
+  * 今天想多記一個欄位（例如：模型延遲、使用者評分），直接寫上去即可，不需要重新印刷整本書（免改 Schema）。
+  * 30 天過期的日誌，時間到了本子會自己化解消失（原生 TTL 索引自動清理），不需要人工手動撕紙。
+
+### 3. 為什麼不直接用 PostgreSQL 的 JSONB 存日誌？
+| 比較維度 | PostgreSQL (JSONB) | MongoDB (NoSQL) | 為什麼此場景選 MongoDB |
+| :--- | :--- | :--- | :--- |
+| **對話更新機制** | 每次追加對話，底層必須整行複製重寫（MVCC 寫入放大與表格膨脹）。 | 支援文件內原地更新（In-place `$push`），直接掛載到陣列尾端。 | 對話輪次頻繁更新時，MongoDB 磁碟 I/O 成本極低。 |
+| **快取資源保護** | 日誌寫入與向量檢索搶奪同一塊記憶體緩衝區（Buffer Pool）。 | 獨立實體或獨立引擎，日誌寫入絕不干擾手冊檢索的 HNSW 向量快取。 | 避免日誌流量衝擊核心手冊檢索的反應速度（SLA）。 |
+| **過期資料清理** | 需透過外部腳本定時執行大量 `DELETE`，容易造成長鎖與效能抖動。 | 內建 TTL 索引（Time To Live），底層非同步自動回收空間。 | 零運維成本，一行設定即實現 30 天日誌自動淘汰。 |
+| **巢狀資料分析** | 分析多輪對話需使用多層 `LATERAL JOIN` 與子查詢，耗費 CPU。 | 原生 Aggregation Pipeline（`$unwind` 搭配 `$group`）串流運算。 | 輕鬆產出 P95 延遲、使用者滿意度與高頻搜尋詞報表。 |
+
+### 4. 存檔結構視覺化範例
+
+* **會話資料（chat_sessions）── 內嵌式結構**：
+  ```json
+  {
+    "session_id": "sess_20260929_001",
+    "user_id": "ricky",
+    "turn_count": 2,
+    "turns": [
+      {
+        "turn_id": 1,
+        "query": "感測器如何安裝在樹幹上？",
+        "response": "根據手冊說明，需使用隨附的金屬束帶固定於離地 1.5 公尺處...",
+        "latency_ms": 312.4
+      }
+    ]
+  }
+  ```
+
+* **稽核日誌（search_audit_logs）── 時序自動淘汰**：
+  ```json
+  {
+    "timestamp": "2026-09-29T09:00:00Z",
+    "query": "感測器如何安裝在樹幹上？",
+    "vector_latency_ms": 45.1,
+    "keyword_latency_ms": 12.3,
+    "rerank_latency_ms": 120.5,
+    "total_latency_ms": 177.9,
+    "status": "success"
+  }
+  ```
+  *(透過 `expireAfterSeconds: 2592000` 設定 30 天後自動刪除)*
+
+### 5. 模組架構與檔案職責
+* **[nosql/mongo_client.py](file:///Users/rickyho/Documents/github/scanPdf/nosql/mongo_client.py)**：
+  * 單例模式管理連線池（`maxPoolSize=20`、`minPoolSize=2`），防範吃滿連線。
+  * `init_indexes()` 自癒函式：自動建立會話複合索引（`user_id` + `updated_at`）與 30 天原生物理過期 TTL 索引（`idx_ttl_30d`）。
+  * 支援斷線無感自動降級，連線異常時不影響主檢索服務。
+* **[nosql/models.py](file:///Users/rickyho/Documents/github/scanPdf/nosql/models.py)**：
+  * Pydantic 資料結構治理層（`ChatTurnModel`、`ChatSessionModel`、`SearchAuditLogModel`），統一 UTC 時間與數值邊界，杜絕動態綱要之髒資料。
+* **[nosql/session_logger.py](file:///Users/rickyho/Documents/github/scanPdf/nosql/session_logger.py)**：
+  * 採用雙背景執行緒池（`ThreadPoolExecutor`）進行無阻塞非同步寫入，Gradio 前端零延遲。
+  * 單文件高內聚原子更新：`$push` 搭配 `$slice: -50`，嚴格限制每個會話最多內嵌 50 輪問答，杜絕 16 MB 上限溢出。
+* **[nosql/analytics_pipeline.py](file:///Users/rickyho/Documents/github/scanPdf/nosql/analytics_pipeline.py)**：
+  * 封裝四組企業級聚合管線：
+    1. 檢索模式平均與最大耗時分組統計（`$group` + `$avg` + `$project` + `$round`）。
+    2. 熱門搜尋問題詞彙頻次與延遲排序（`$group` + `$sort` + `$limit`）。
+    3. 會話輪次結構重塑與摘要（`$project`）。
+    4. 使用者滿意度星級分佈（`$unwind` + `$match`）。
+
+### 6. MongoDB Atlas 雲端 M0 免費版限制與防禦矩陣
+* **免安裝本機服務**：目前專案已直連 MongoDB Atlas 雲端叢集（`mongodb+srv://...`），無需在 macOS 下載或運行本機資料庫。
+* **核心配額與防禦機制**：
+  | 雲端配額項目 | M0 限制門檻 | 系統標準防禦機制 |
+  | :--- | :--- | :--- |
+  | **儲存容量** | 512 MB 上限 | 向量（Embedding）嚴格留存於 PostgreSQL；MongoDB 僅存輕量日誌，並以 30 天 TTL 索引自動非同步物理回收。 |
+  | **併發連線** | 500 連線限制 | Python 驅動程式配置 `maxPoolSize=20` 保守連線池。 |
+  | **網路頻寬** | 7 天 10 GB 限制 | 僅傳輸輕量 JSON，嚴禁全量拉取備份。 |
+  | **單文件大小** | 16 MB 限制 | `$slice: -50` 視窗截斷，單一會話文件體積不超過 100 KB。 |
+
+### 7. 測試與面試展示指令
+* **驗證連線與索引自癒**：
+  ```bash
+  uv run python nosql/mongo_client.py
+  ```
+* **執行求職面試級指標聚合分析展示**：
+  ```bash
+  uv run python scripts/demo_mongodb_interview.py
+  ```
+
+---
+
 ## To do
 1. Redis for memory
+2. [x] MongoDB for chat sessions & search audit logging（已實作完成，整合多模型持久化與聚合管線）
+
+## 部署到huggingface space 方法
+- uv run python scripts/deploy_space.py
+
+
