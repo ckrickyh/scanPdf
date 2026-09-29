@@ -44,10 +44,10 @@ def scan_pdf_with_ppocr_vl(pdf_path: str, output_dir: str = "output"):
     print(f"\n全部處理完成！結構化 Markdown 與 JSON 已儲存至：{output_path.resolve()}")
 
 if __name__ == "__main__":
-    current_dir = Path(__file__).resolve().parent
+    current_dir = Path(__file__).resolve().parent # resolve 絕對路徑（Absolute Path）
     project_root = current_dir.parent
 
     # 預設指定原始手冊路徑與輸出目錄
-    source_pdf = current_dir / "source" / "PiCUSQ72Manual.pdf"
-    output_dir = project_root / "output"
+    source_pdf = current_dir / "source" / "PiCUSQ72Manual.pdf" # source PDF file
+    output_dir = project_root / "output"    # output directory 
     scan_pdf_with_ppocr_vl(pdf_path=str(source_pdf), output_dir=str(output_dir))

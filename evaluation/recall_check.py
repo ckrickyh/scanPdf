@@ -26,16 +26,22 @@ import ollama
 from pgvector.psycopg import register_vector
 import psycopg
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
 try:
     from chunkingRAG.db_config import (
         get_embedding_model,
         get_pg_conn_string,
     )
+    from chunkingRAG.search_manual import get_query_embedding
 except ImportError:
     from db_config import (
         get_embedding_model,
         get_pg_conn_string,
     )
+    from search_manual import get_query_embedding
 
 PG_CONN_STRING = get_pg_conn_string()
 EMBEDDING_MODEL = get_embedding_model()
@@ -114,8 +120,7 @@ def retrieve_candidates(
     chunk_type: str | None = None,
 ) -> list[dict[str, Any]]:
     """向 PostgreSQL 執行 pgvector 餘弦相似度檢索，取得前 top_k 個候選區塊。"""
-    res = ollama.embeddings(model=EMBEDDING_MODEL, prompt=query)
-    query_vec = res["embedding"]
+    query_vec = get_query_embedding(query)
 
     type_clause = "WHERE chunk_type = %s" if chunk_type else ""
     sql = f"""
@@ -123,11 +128,7 @@ def retrieve_candidates(
             chunk_id,
             source_file,
             chunk_type,
-            TRIM(BOTH ' > ' FROM (
-                COALESCE(h1, '') || 
-                CASE WHEN h2 IS NOT NULL AND h2 != '' THEN ' > ' || h2 ELSE '' END || 
-                CASE WHEN h3 IS NOT NULL AND h3 != '' THEN ' > ' || h3 ELSE '' END
-            )) AS chapter_path,
+            chapter_path,
             content,
             1 - (embedding <=> %s::vector) AS cosine_similarity
         FROM manual_chunks

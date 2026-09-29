@@ -1,9 +1,14 @@
 import os
+from pathlib import Path
 import re
 import sys
 import psycopg
 from pgvector.psycopg import register_vector
 import ollama
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
 try:
     from chunkingRAG.db_config import (

@@ -1,4 +1,5 @@
 import os
+import time
 import psycopg
 from pgvector.psycopg import register_vector
 import gradio as gr
@@ -51,10 +52,11 @@ def generate_llm_answer(
     chunks_data: list[dict | tuple],
     top_p: float = 0.85,
     temperature: float = 0.2,
+    response_style: str = "標準詳細",
 ) -> str:
     """
     使用 Google Gemini API 依據檢索切塊生成綜合繁體中文回答。
-    支援 Top-P 與 Temperature 調優，增強事實確定性並壓制幻覺。
+    支援 Top-P、Temperature 與 回覆篇幅深度（Token 限制與語意規範）調優。
     """
     api_key = get_gemini_api_key()
     if not api_key:
@@ -66,6 +68,23 @@ def generate_llm_answer(
 
     if not chunks_data:
         return "資料庫查無相關切塊，無法提供 AI 綜合回答。"
+
+    # 篇幅與深度配置
+    style_configs = {
+        "精簡條列": {
+            "max_tokens": 400,
+            "instruction": "請嚴格將回覆精簡在 150 字以內，僅以極簡重點項目（Bullet points）列出核心解答，省略冗長背景鋪陳與過渡文字。"
+        },
+        "標準詳細": {
+            "max_tokens": 1000,
+            "instruction": "請以結構化段落完整作答，兼顧技術背景、操作步驟與核心事實依據。"
+        },
+        "深入完整": {
+            "max_tokens": 2500,
+            "instruction": "請進行深度技術解析，詳盡列出所有關聯之數據規格、操作條件、原理細節與潛在防護注意事項。"
+        }
+    }
+    current_style = style_configs.get(response_style, style_configs["標準詳細"])
 
     # 組合上下文與來源資訊
     context_blocks = []
@@ -96,6 +115,7 @@ def generate_llm_answer(
 2. 嚴格根據參考文件作答，不得憑空捏造或加入未提及的事實。
 3. 若參考文件未包含足夠資訊回答問題，請直接明確告知無法從現有資料獲取答案。
 4. 回答請條理清晰、層次分明，可適度標註資訊引用的來源序號（例如：[資料來源 1]）。
+5. 篇幅與深度規範：{current_style["instruction"]}
 
 【參考文件】：
 {context_text}
@@ -105,28 +125,63 @@ def generate_llm_answer(
 
 請開始回答："""
 
-    try:
-        client = genai.Client(api_key=api_key)
-        config = types.GenerateContentConfig(
-            temperature=temperature,
-            top_p=top_p,
-        )
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=config,
-        )
-        if response.text:
-            return response.text
-        return "模型未回傳有效文字內容。"
+    max_retries = 3
+    base_delay = 1.5  # 秒
+    candidate_models = [GEMINI_MODEL]
+    if GEMINI_MODEL != "gemini-2.5-flash-lite":
+        candidate_models.append("gemini-2.5-flash-lite")
 
-    except Exception as e:
-        return (
-            f"> [!WARNING]\n"
-            f"> **Google Gemini API 呼叫失敗**\n"
-            f"> 錯誤原因：`{str(e)}`\n\n"
-            f"> 請檢查 `.env` 中的 `GEMINI_API_KEY` 是否有效，或確認網路連線與 Google 配額狀態。"
-        )
+    last_error = None
+    client = genai.Client(api_key=api_key)
+    config = types.GenerateContentConfig(
+        temperature=temperature,
+        top_p=top_p,
+        max_output_tokens=current_style["max_tokens"],
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+    )
+
+    for current_model in candidate_models:
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = client.models.generate_content(
+                    model=current_model,
+                    contents=prompt,
+                    config=config,
+                )
+                if response.text:
+                    if current_model != GEMINI_MODEL:
+                        return (
+                            f"> [!NOTE]\n"
+                            f"> **主模型（{GEMINI_MODEL}）連線繁忙，已自動降級切換至備援模型（{current_model}）生成回答**\n\n"
+                            + response.text
+                        )
+                    return response.text
+                return "模型未回傳有效文字內容。"
+
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                # 判定是否為可重試之暫時性尖峰或配額限制 (429 流量管制, 503 服務超載, 504 逾時, 網路波動)
+                is_retryable = any(
+                    kw in err_str
+                    for kw in ["429", "resource_exhausted", "quota", "503", "unavailable", "timeout", "deadline", "connection", "overloaded"]
+                )
+
+                if not is_retryable:
+                    # 遇到認證失敗或參數錯誤等非暫時性錯誤，不再重試直接中止
+                    break
+
+                if attempt < max_retries:
+                    wait_time = base_delay * (2 ** (attempt - 1))
+                    print(f"[Gemini 呼叫重試] 模型 {current_model} 第 {attempt} 次呼叫繁忙 ({str(e)})，將於 {wait_time:.1f} 秒後重試...")
+                    time.sleep(wait_time)
+
+    return (
+        f"> [!WARNING]\n"
+        f"> **Google Gemini API 呼叫失敗（已自動重試 {max_retries} 次）**\n"
+        f"> 最後錯誤原因：`{str(last_error)}`\n\n"
+        f"> 建議：當前 Google API 流量處於尖峰或已達免費層每分鐘呼叫上限（RPM/TPM），請稍候 30 至 60 秒後再次嘗試。"
+    )
 
 
 def get_database_statistics() -> str:
@@ -154,7 +209,7 @@ def get_database_statistics() -> str:
             f"- **總區塊數**：`{total}` 筆\n"
             f"- **純文字區塊**：`{texts}` 筆\n"
             f"- **表格區塊**：`{tables}` 筆\n"
-            f"- **連線端點**：`{conn_str.split('@')[-1] if '@' in conn_str else 'local'}`\n"
+            f"- **連線端點**：`{'Supabase Cloud (SSL 加密連線)' if target == 'supabase' else 'Localhost (本機連線)'}`\n"
             f"- **Gemini 狀態**：`{gemini_status}`"
         )
     except Exception as e:
@@ -165,7 +220,13 @@ def get_database_statistics() -> str:
             f"- **Gemini 狀態**：`{gemini_status}`"
         )
 
-
+try:
+    import spaces
+    gpu_decorator = spaces.GPU
+except ImportError:
+    gpu_decorator = lambda f: f
+    
+@gpu_decorator
 def perform_search(
     query: str,
     chunk_type: str,
@@ -174,6 +235,7 @@ def perform_search(
     candidates_k: int = 15,
     top_p: float = 0.85,
     use_hybrid: bool = True,
+    response_style: str = "標準詳細",
 ) -> tuple[str, str]:
     """執行雙路混合檢索（Vector + BM25 tsvector）、Cross-Encoder 重排與 Google Gemini 生成回答"""
     if not query.strip():
@@ -202,7 +264,7 @@ def perform_search(
                                 chunk_id,
                                 source_file,
                                 chunk_type,
-                                concat_ws(' > ', NULLIF(h1, ''), NULLIF(h2, ''), NULLIF(h3, ''), NULLIF(h4, ''), NULLIF(h5, '')) AS chapter_path,
+                                chapter_path,
                                 content,
                                 1 - (embedding <=> %(vec)s::vector) AS cosine_similarity,
                                 ROW_NUMBER() OVER (ORDER BY embedding <=> %(vec)s::vector) AS rank_vec
@@ -216,7 +278,7 @@ def perform_search(
                                 chunk_id,
                                 source_file,
                                 chunk_type,
-                                concat_ws(' > ', NULLIF(h1, ''), NULLIF(h2, ''), NULLIF(h3, ''), NULLIF(h4, ''), NULLIF(h5, '')) AS chapter_path,
+                                chapter_path,
                                 content,
                                 1 - (embedding <=> %(vec)s::vector) AS cosine_similarity,
                                 ts_rank(tsv, plainto_tsquery('english', %(query)s)) AS bm25_score,
@@ -273,13 +335,7 @@ def perform_search(
                             chunk_id,
                             source_file,
                             chunk_type,
-                            concat_ws(' > ', 
-                                NULLIF(h1, ''), 
-                                NULLIF(h2, ''), 
-                                NULLIF(h3, ''), 
-                                NULLIF(h4, ''), 
-                                NULLIF(h5, '')
-                            ) AS chapter_path,
+                            chapter_path,
                             content,
                             1 - (embedding <=> %s::vector) AS cosine_similarity,
                             NULL AS rank_vec,
@@ -321,14 +377,14 @@ def perform_search(
             for r in raw_results[:top_k]
         ]
 
-    # 2. 呼叫 Google Gemini 生成綜合回答（注入 top_p 控制）
-    llm_answer = generate_llm_answer(query, final_chunks, top_p=top_p)
+    # 2. 呼叫 Google Gemini 生成綜合回答（注入 top_p 與回覆長度控制）
+    llm_answer = generate_llm_answer(query, final_chunks, top_p=top_p, response_style=response_style)
 
     # 3. 格式化檢索切塊明細展示
     md_output = []
     search_desc = "雙路混合檢索（Vector + BM25 RRF）" if use_hybrid else "單路向量檢索"
     mode_desc = f"{search_desc} -> Cross-Encoder 重排（初篩召回：{len(raw_results)} 筆 -> 精選：{len(final_chunks)} 筆）" if use_rerank else f"{search_desc}（Top-{top_k}）"
-    md_output.append(f"> **檢索模式**：{mode_desc} | **Top-P**：`{top_p}`\n")
+    md_output.append(f"> **檢索模式**：{mode_desc} | **Top-P**：`{top_p}` | **回覆長度**：`{response_style}`\n")
 
     for rank, item in enumerate(final_chunks, start=1):
         cid = item["chunk_id"]
@@ -367,58 +423,154 @@ def perform_search(
 
 # 建立 Gradio 使用者介面
 custom_css = """
+/* ============================================================== */
+/* 基礎樣式（明亮模式預設） */
+/* ============================================================== */
 .status-box {
     background-color: #f8fafc;
-    color: #0f172a !important;
+    color: #1e293b;
     border-radius: 8px;
-    padding: 12px;
+    padding: 14px;
     border: 1px solid #cbd5e1;
+    line-height: 1.6;
 }
-.status-box * {
-    color: #0f172a !important;
+.status-box p, .status-box li, .status-box span, .status-box strong {
+    color: #1e293b;
+}
+.status-box code {
+    background-color: #e2e8f0;
+    color: #0284c7;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 600;
 }
 
 .answer-box {
     background-color: #f0fdf4;
-    color: #052e16 !important;
+    color: #064e3b;
     border-radius: 8px;
-    padding: 16px;
+    padding: 18px;
     border: 1px solid #86efac;
     min-height: 120px;
+    line-height: 1.7;
+    font-size: 15px;
 }
-.answer-box * {
-    color: #052e16 !important;
+.answer-box p, .answer-box li, .answer-box span, .answer-box div {
+    color: #064e3b;
 }
-
-:is(.dark, [data-theme="dark"]) .status-box {
-    background-color: #1e293b !important;
-    border-color: #334155 !important;
+.answer-box strong {
+    color: #022c22;
 }
-:is(.dark, [data-theme="dark"]) .status-box,
-:is(.dark, [data-theme="dark"]) .status-box * {
-    color: #ffffff !important;
-}
-:is(.dark, [data-theme="dark"]) .status-box code {
-    background-color: #334155 !important;
-    color: #ffffff !important;
-}
-
-:is(.dark, [data-theme="dark"]) .answer-box {
-    background-color: #064e3b !important;
-    border-color: #059669 !important;
-}
-:is(.dark, [data-theme="dark"]) .answer-box,
-:is(.dark, [data-theme="dark"]) .answer-box * {
-    color: #ffffff !important;
-}
-:is(.dark, [data-theme="dark"]) .answer-box code {
-    background-color: #047857 !important;
-    color: #ffffff !important;
+.answer-box code {
+    background-color: #dcfce7;
+    color: #15803d;
+    padding: 2px 6px;
+    border-radius: 4px;
 }
 
 .main-title, .main-title h1 {
     color: #ea580c !important;
     font-weight: 700;
+}
+
+/* ============================================================== */
+/* 深色模式支援（包含 Gradio .dark 類別與各層級選取器） */
+/* ============================================================== */
+.dark .status-box,
+body.dark .status-box,
+gradio-app.dark .status-box,
+[data-theme="dark"] .status-box,
+:is(.dark, [data-theme="dark"]) .status-box {
+    background-color: #1e293b !important;
+    border-color: #475569 !important;
+}
+
+.dark .status-box,
+.dark .status-box *,
+body.dark .status-box *,
+gradio-app.dark .status-box *,
+[data-theme="dark"] .status-box * {
+    color: #f8fafc !important;
+}
+
+.dark .status-box code,
+body.dark .status-box code,
+gradio-app.dark .status-box code {
+    background-color: #0f172a !important;
+    color: #38bdf8 !important;
+    border: 1px solid #334155;
+}
+
+.dark .answer-box,
+body.dark .answer-box,
+gradio-app.dark .answer-box,
+[data-theme="dark"] .answer-box,
+:is(.dark, [data-theme="dark"]) .answer-box {
+    background-color: #064e3b !important;
+    border-color: #10b981 !important;
+}
+
+.dark .answer-box,
+.dark .answer-box *,
+body.dark .answer-box *,
+gradio-app.dark .answer-box *,
+[data-theme="dark"] .answer-box * {
+    color: #f0fdf4 !important;
+}
+
+.dark .answer-box strong,
+body.dark .answer-box strong {
+    color: #ffffff !important;
+}
+
+.dark .answer-box code,
+body.dark .answer-box code {
+    background-color: #022c22 !important;
+    color: #6ee7b7 !important;
+    border: 1px solid #047857;
+}
+
+/* ============================================================== */
+/* 系統層級深色模式（Mac / 瀏覽器 prefers-color-scheme，無類別亦強制生效） */
+/* ============================================================== */
+@media (prefers-color-scheme: dark) {
+    .status-box {
+        background-color: #1e293b !important;
+        border-color: #475569 !important;
+    }
+    .status-box,
+    .status-box *,
+    .status-box p,
+    .status-box li,
+    .status-box span {
+        color: #f8fafc !important;
+    }
+    .status-box code {
+        background-color: #0f172a !important;
+        color: #38bdf8 !important;
+        border: 1px solid #334155 !important;
+    }
+
+    .answer-box {
+        background-color: #064e3b !important;
+        border-color: #10b981 !important;
+    }
+    .answer-box,
+    .answer-box *,
+    .answer-box p,
+    .answer-box li,
+    .answer-box span,
+    .answer-box div {
+        color: #f0fdf4 !important;
+    }
+    .answer-box strong {
+        color: #ffffff !important;
+    }
+    .answer-box code {
+        background-color: #022c22 !important;
+        color: #6ee7b7 !important;
+        border: 1px solid #047857 !important;
+    }
 }
 """
 
@@ -483,15 +635,21 @@ with gr.Blocks(title="PDF 語意切分檢索系統") as demo:
                 step=0.05,
                 info="調低更忠於手冊原文、調高更具文字發散性"
             )
+            response_style_radio = gr.Radio(
+                label="回覆篇幅偏好",
+                choices=["精簡條列", "標準詳細", "深入完整"],
+                value="標準詳細",
+                info="控制 AI 生成內容的篇幅長度與技術細節密度（兼具 Token 上限與語意引導）"
+            )
             search_btn = gr.Button("開始檢索與回答", variant="primary")
 
             gr.Examples(
                 examples=[
-                    ["感測器如何安裝在樹幹上？", "全部", 3, True, 15, 0.85, True],
-                    ["安全防護措施注意事項", "全部", 3, True, 15, 0.85, True],
-                    ["規格參數對照表", "table", 2, True, 10, 0.85, True],
+                    ["感測器如何安裝在樹幹上？", "全部", 3, True, 15, 0.85, True, "標準詳細"],
+                    ["安全防護措施注意事項", "全部", 3, True, 15, 0.85, True, "精簡條列"],
+                    ["規格參數對照表", "table", 2, True, 10, 0.85, True, "深入完整"],
                 ],
-                inputs=[input_query, input_type, input_top_k, use_rerank_cb, candidates_slider, top_p_slider, use_hybrid_cb]
+                inputs=[input_query, input_type, input_top_k, use_rerank_cb, candidates_slider, top_p_slider, use_hybrid_cb, response_style_radio]
             )
 
         with gr.Column(scale=2):
@@ -508,7 +666,7 @@ with gr.Blocks(title="PDF 語意切分檢索系統") as demo:
 
     search_btn.click(
         fn=perform_search,
-        inputs=[input_query, input_type, input_top_k, use_rerank_cb, candidates_slider, top_p_slider, use_hybrid_cb],
+        inputs=[input_query, input_type, input_top_k, use_rerank_cb, candidates_slider, top_p_slider, use_hybrid_cb, response_style_radio],
         outputs=[output_llm, output_chunks]
     )
 
@@ -521,7 +679,14 @@ with gr.Blocks(title="PDF 語意切分檢索系統") as demo:
 
 if __name__ == "__main__":
     import threading
+    share_enabled = os.getenv("GRADIO_SHARE", "false").strip().lower() == "true"
     # 於背景執行緒預載 Reranker 模型與 FP16 加速，消除首次查詢之 15 秒冷啟動延遲
     threading.Thread(target=RerankerService.get_model, daemon=True).start()
-    demo.launch(server_name="0.0.0.0", server_port=7860, css=custom_css)
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=share_enabled,
+        css=custom_css,
+    )
+
 

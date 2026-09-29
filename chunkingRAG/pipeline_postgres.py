@@ -39,19 +39,48 @@ HTML_TABLE_REGEX = re.compile(
     re.IGNORECASE
 )
 
-# 2. 標題切分規則配置
+# 2. 標題切分規則配置（支援 H1 至 H6）
 HEADERS_TO_SPLIT_ON = [
     ("#", "H1"),
     ("##", "H2"),
     ("###", "H3"),
     ("####", "H4"),
     ("#####", "H5"),
+    ("######", "H6"),
 ]
 
 header_splitter = MarkdownHeaderTextSplitter(
     headers_to_split_on=HEADERS_TO_SPLIT_ON,
     strip_headers=False
 )
+
+def build_breadcrumb_from_stack(stack: dict[int, str], max_len: int = 150) -> str:
+    """
+    自章節層級堆疊字典安全構建麵包屑路徑，
+    以整數序數排序徹底避免字母排序錯亂（如 H10 排在 H2 前面），
+    並以 ' / ' 分隔，超出 max_len 時實施防稀釋截斷。
+    """
+    if not stack:
+        return "未分類章節"
+
+    sorted_items = sorted(stack.items(), key=lambda x: x[0])
+    titles = [item[1] for item in sorted_items]
+    full_path = " / ".join(titles)
+
+    if len(full_path) > max_len and len(titles) > 2:
+        return f"{titles[0]} / ... / {titles[-1]}"
+    return full_path
+
+
+def build_breadcrumb_path(meta: dict, max_len: int = 150) -> str:
+    """自 metadata 字典提取章節階層並轉為路徑字串"""
+    h_items = {}
+    for k, v in meta.items():
+        m = re.match(r"^H(\d+)$", k)
+        if m and v and str(v).strip():
+            h_items[int(m.group(1))] = str(v).strip()
+
+    return build_breadcrumb_from_stack(h_items, max_len)
 
 # 3. 語意切分器初始化
 langchain_embeddings = OllamaEmbeddings(
@@ -106,31 +135,48 @@ def extract_overlap_prefix(
 
 
 def chunk_text_with_overlap(
-    text: str, target_overlap_chars: int = 250, max_safe_length: int = 1000
+    text: str,
+    target_overlap_chars: int = 250,
+    max_safe_length: int = 1000,
+    chunker_type: str = "semantic",
+    initial_prev_chunk: str = ""
 ) -> list[str]:
     """
-    對純文字先進行語意切分；若單塊長度超出 max_safe_length，
-    自動觸發 RecursiveCharacterTextSplitter 進行安全二次切分，
+    純文字切分處理：
+    - semantic: 先執行語意切分（SemanticChunker），對超過 max_safe_length 之區塊執行遞迴字元兜底切分。
+    - recursive: 直接使用 RecursiveCharacterTextSplitter 進行高速字元切分。
     並自動為後續區塊補充前一區塊累積約 100-120 Tokens（250 字元）之完整句子以形成上下文重疊。
+    支援跨切塊 / 跨檔案前綴銜接（initial_prev_chunk）。
     """
     if not text.strip():
         return []
 
-    raw_chunks = semantic_splitter.split_text(text)
+    if chunker_type == "semantic":
+        raw_chunks = semantic_splitter.split_text(text)
+        normalized_chunks = []
+        for chunk in raw_chunks:
+            if len(chunk) > max_safe_length:
+                sub_splits = safety_fallback_splitter.split_text(chunk)
+                normalized_chunks.extend(sub_splits)
+            else:
+                normalized_chunks.append(chunk)
+    else:
+        normalized_chunks = safety_fallback_splitter.split_text(text)
 
-    # 針對過長語意區塊進行 Recursive 二次安全切分
-    normalized_chunks = []
-    for chunk in raw_chunks:
-        if len(chunk) > max_safe_length:
-            sub_splits = safety_fallback_splitter.split_text(chunk)
-            normalized_chunks.extend(sub_splits)
+    if not normalized_chunks:
+        return []
+
+    final_chunks = []
+    # 若有傳入跨切塊/跨檔案前置文字，為第一個切塊加上重疊前綴
+    if initial_prev_chunk:
+        overlap_prefix = extract_overlap_prefix(initial_prev_chunk, target_overlap_chars)
+        if overlap_prefix:
+            final_chunks.append(f"{overlap_prefix}\n{normalized_chunks[0]}")
         else:
-            normalized_chunks.append(chunk)
+            final_chunks.append(normalized_chunks[0])
+    else:
+        final_chunks.append(normalized_chunks[0])
 
-    if len(normalized_chunks) <= 1:
-        return normalized_chunks
-
-    final_chunks = [normalized_chunks[0]]
     for i in range(1, len(normalized_chunks)):
         prev_chunk = normalized_chunks[i - 1]
         curr_chunk = normalized_chunks[i]
@@ -155,29 +201,24 @@ def init_database(conn: psycopg.Connection):
                 source_file VARCHAR(255) NOT NULL,
                 chunk_type VARCHAR(20) NOT NULL, -- 'text' 或 'table'
                 chunk_index INT NOT NULL,
-                h1 TEXT,
-                h2 TEXT,
-                h3 TEXT,
-                h4 TEXT,
-                h5 TEXT,
+                chapter_path TEXT,
                 content TEXT NOT NULL,
                 embedding vector(1024) NOT NULL, -- 對應 bge-m3 輸出之 1024 維度
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
-            -- 補齊支援深層章節之標題欄位
-            ALTER TABLE manual_chunks ADD COLUMN IF NOT EXISTS h4 TEXT;
-            ALTER TABLE manual_chunks ADD COLUMN IF NOT EXISTS h5 TEXT;
+            -- 補齊支援統一麵包屑路徑欄位
+            ALTER TABLE manual_chunks ADD COLUMN IF NOT EXISTS chapter_path TEXT;
 
             -- 建立全文檢索自動計算欄位（tsvector）
             -- 運作機制拆解：
             -- 1. to_tsvector('english', ...)：調用英文文法字典進行切詞、過濾贅詞（the, is）並還原詞根（mounting -> mount），但不設定權重。
-            -- 2. setweight(..., 'A'/'B')：專責替切好的單字陣列蓋上重要性權重等級章（'A' 標記標題 manual_chunks.h1~h5，'B' 標記正文 manual_chunks.content）。
-            -- 3. 符號 ||：將標題與內文兩份加權後的詞彙清單串接合併為單一 tsvector。
+            -- 2. setweight(..., 'A'/'B')：專責替切好的單字陣列蓋上重要性權重等級章（'A' 標記完整章節路徑 chapter_path，'B' 標記正文 content）。
+            -- 3. 符號 ||：將標題路徑與內文兩份加權後的詞彙清單串接合併為單一 tsvector。
             -- 4. STORED 關鍵字：資料庫自動運算斷詞並持久化儲存，新增資料時自動維護，完全不需手動重新切塊。
             ALTER TABLE manual_chunks 
             ADD COLUMN IF NOT EXISTS tsv tsvector 
             GENERATED ALWAYS AS (
-                setweight(to_tsvector('english', coalesce(h1, '') || ' ' || coalesce(h2, '') || ' ' || coalesce(h3, '') || ' ' || coalesce(h4, '') || ' ' || coalesce(h5, '')), 'A') ||
+                setweight(to_tsvector('english', coalesce(chapter_path, '')), 'A') ||
                 setweight(to_tsvector('english', coalesce(content, '')), 'B')
             ) STORED;
 
@@ -215,7 +256,11 @@ def clean_for_embedding(text: str) -> str:
     return cleaned
 
 
-def run_pipeline(output_dir_str: str = "./output", batch_size: int = 32):
+def run_pipeline(
+    output_dir_str: str = "./output",
+    batch_size: int = 32,
+    chunker_type: str = "semantic"
+):
     output_dir = Path(output_dir_str)
     if not output_dir.is_absolute() and not output_dir.exists():
         fallback_dir = Path(__file__).resolve().parent.parent / output_dir_str.lstrip("./")
@@ -227,7 +272,12 @@ def run_pipeline(output_dir_str: str = "./output", batch_size: int = 32):
 
     records_to_insert: list[dict] = []
     md_files = sorted(output_dir.glob("*.md"), key=natural_sort_key)
-    print(f"發現 {len(md_files)} 份 Markdown 檔案，開始執行結構化切分流程...", flush=True)
+    print(f"發現 {len(md_files)} 份 Markdown 檔案，開始執行結構化切分流程（切分模式：{chunker_type}）...", flush=True)
+
+    # 跨檔案上下文與章節延續器（Cross-File Context Carryover）
+    active_header_stack: dict[int, str] = {}
+    last_valid_chapter_path: str = "未分類章節"
+    last_text_chunk_across_files: str = ""
 
     for file_idx, md_file in enumerate(md_files):
         content = md_file.read_text(encoding="utf-8")
@@ -241,11 +291,25 @@ def run_pipeline(output_dir_str: str = "./output", batch_size: int = 32):
         for sec in sections:
             sec_text = sec.page_content
             meta = sec.metadata
-            h1 = meta.get("H1")
-            h2 = meta.get("H2")
-            h3 = meta.get("H3")
-            h4 = meta.get("H4")
-            h5 = meta.get("H5")
+
+            # 跨檔案章節階層繼承機制
+            current_headers = {}
+            if meta:
+                for k, v in meta.items():
+                    m = re.match(r"^H(\d+)$", k)
+                    if m and v and str(v).strip():
+                        current_headers[int(m.group(1))] = str(v).strip()
+
+            if current_headers:
+                min_lvl = min(current_headers.keys())
+                # 清除當前層級及以下的所有子標題，保留上位父層級
+                active_header_stack = {lvl: title for lvl, title in active_header_stack.items() if lvl < min_lvl}
+                active_header_stack.update(current_headers)
+                chapter_path = build_breadcrumb_from_stack(active_header_stack)
+                last_valid_chapter_path = chapter_path
+            else:
+                # 本區塊無標題（如跨頁承接段落），無縫繼承前頁有效章節
+                chapter_path = last_valid_chapter_path
 
             # 階段二：分離 HTML 表格與非表格文字
             matches = list(HTML_TABLE_REGEX.finditer(sec_text))
@@ -257,16 +321,23 @@ def run_pipeline(output_dir_str: str = "./output", batch_size: int = 32):
 
                 # 階段三（A）：處理表格前的純文字
                 if pre_text:
-                    for text_chunk in chunk_text_with_overlap(pre_text, target_overlap_chars=250):
+                    text_chunks = chunk_text_with_overlap(
+                        pre_text,
+                        target_overlap_chars=250,
+                        chunker_type=chunker_type,
+                        initial_prev_chunk=last_text_chunk_across_files
+                    )
+                    for text_chunk in text_chunks:
                         records_to_insert.append({
                             "chunk_id": f"{md_file.stem}_c{chunk_idx}",
                             "source_file": md_file.name,
                             "chunk_type": "text",
                             "chunk_index": chunk_idx,
-                            "h1": h1, "h2": h2, "h3": h3, "h4": h4, "h5": h5,
+                            "chapter_path": chapter_path,
                             "content": text_chunk
                         })
                         chunk_idx += 1
+                        last_text_chunk_across_files = text_chunk
 
                 # 階段三（B）：處理表格本體（整張獨立入庫）
                 table_html = match.group(1).strip()
@@ -275,7 +346,7 @@ def run_pipeline(output_dir_str: str = "./output", batch_size: int = 32):
                     "source_file": md_file.name,
                     "chunk_type": "table",
                     "chunk_index": chunk_idx,
-                    "h1": h1, "h2": h2, "h3": h3, "h4": h4, "h5": h5,
+                    "chapter_path": chapter_path,
                     "content": table_html
                 })
                 chunk_idx += 1
@@ -285,16 +356,23 @@ def run_pipeline(output_dir_str: str = "./output", batch_size: int = 32):
             # 階段三（C）：處理剩餘之純文字
             tail_text = sec_text[last_idx:].strip()
             if tail_text:
-                for text_chunk in chunk_text_with_overlap(tail_text, target_overlap_chars=250):
+                text_chunks = chunk_text_with_overlap(
+                    tail_text,
+                    target_overlap_chars=250,
+                    chunker_type=chunker_type,
+                    initial_prev_chunk=last_text_chunk_across_files
+                )
+                for text_chunk in text_chunks:
                     records_to_insert.append({
                         "chunk_id": f"{md_file.stem}_c{chunk_idx}",
                         "source_file": md_file.name,
                         "chunk_type": "text",
                         "chunk_index": chunk_idx,
-                        "h1": h1, "h2": h2, "h3": h3, "h4": h4, "h5": h5,
+                        "chapter_path": chapter_path,
                         "content": text_chunk
                     })
                     chunk_idx += 1
+                    last_text_chunk_across_files = text_chunk
 
         if (file_idx + 1) % 10 == 0 or file_idx + 1 == len(md_files):
             print(f"[{file_idx + 1}/{len(md_files)}] 已完成切分預處理，累積生成 {len(records_to_insert)} 個區塊...", flush=True)
@@ -307,8 +385,9 @@ def run_pipeline(output_dir_str: str = "./output", batch_size: int = 32):
 
     # 階段四：連線資料庫並批次寫入
     with psycopg.connect(PG_CONN_STRING) as conn:
-        register_vector(conn)
+        # 先建立資料庫綱要與 vector 擴充，再註冊向量類型轉換器
         init_database(conn)
+        register_vector(conn)
 
         for i in range(0, total_chunks, batch_size):
             batch = records_to_insert[i:i + batch_size]
@@ -321,19 +400,15 @@ def run_pipeline(output_dir_str: str = "./output", batch_size: int = 32):
                 cur.executemany("""
                     INSERT INTO manual_chunks (
                         chunk_id, source_file, chunk_type, chunk_index,
-                        h1, h2, h3, h4, h5, content, embedding
+                        chapter_path, content, embedding
                     ) VALUES (
                         %(chunk_id)s, %(source_file)s, %(chunk_type)s, %(chunk_index)s,
-                        %(h1)s, %(h2)s, %(h3)s, %(h4)s, %(h5)s, %(content)s, %(embedding)s
+                        %(chapter_path)s, %(content)s, %(embedding)s
                     )
                     ON CONFLICT (chunk_id) DO UPDATE SET
+                        chapter_path = EXCLUDED.chapter_path,
                         content = EXCLUDED.content,
-                        embedding = EXCLUDED.embedding,
-                        h1 = EXCLUDED.h1,
-                        h2 = EXCLUDED.h2,
-                        h3 = EXCLUDED.h3,
-                        h4 = EXCLUDED.h4,
-                        h5 = EXCLUDED.h5;
+                        embedding = EXCLUDED.embedding;
                 """, [
                     {**item, "embedding": vec}
                     for item, vec in zip(batch, embeddings_vecs)
@@ -348,6 +423,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="技術手冊 RAG 結構化切分與 PostgreSQL (pgvector) 入庫管線")
     parser.add_argument("--output-dir", default="./output", help="輸入 Markdown 目錄路徑（預設：./output）")
     parser.add_argument("--batch-size", type=int, default=32, help="寫入資料庫之批次大小（預設：32）")
+    parser.add_argument(
+        "--chunker",
+        choices=["semantic", "recursive"],
+        default="semantic",
+        help="切分策略模式：semantic (語意切分+兜底) 或 recursive (純遞迴字元切分)"
+    )
     args = parser.parse_args()
 
-    run_pipeline(output_dir_str=args.output_dir, batch_size=args.batch_size)
+    run_pipeline(
+        output_dir_str=args.output_dir,
+        batch_size=args.batch_size,
+        chunker_type=args.chunker
+    )

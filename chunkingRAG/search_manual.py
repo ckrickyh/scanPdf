@@ -22,6 +22,23 @@ except ImportError:
 PG_CONN_STRING = get_pg_conn_string()
 EMBEDDING_MODEL = get_embedding_model()
 
+_ST_MODEL = None
+
+
+def get_query_embedding(query: str) -> list[float]:
+    """計算問題向量：優先嘗試 Ollama，連線失敗時自動降級至 SentenceTransformer 本地推論"""
+    global _ST_MODEL
+    try:
+        res = ollama.embeddings(model=EMBEDDING_MODEL, prompt=query)
+        return res["embedding"]
+    except Exception:
+        from sentence_transformers import SentenceTransformer
+
+        if _ST_MODEL is None:
+            model_id = f"BAAI/{EMBEDDING_MODEL}" if "/" not in EMBEDDING_MODEL else EMBEDDING_MODEL
+            _ST_MODEL = SentenceTransformer(model_id)
+        return _ST_MODEL.encode(query).tolist()
+
 
 def search_manual(
     query: str,
@@ -39,9 +56,8 @@ def search_manual(
     2. 單階段純向量檢索。
     3. 第二階段 Cross-Encoder（bge-reranker-v2-m3）深度語意重排序。
     """
-    # 1. 計算問題向量
-    res = ollama.embeddings(model=EMBEDDING_MODEL, prompt=query)
-    query_vec = res["embedding"]
+    # 1. 計算問題向量（自動容錯與降級）
+    query_vec = get_query_embedding(query)
 
     limit_k = candidates_k if use_reranker else top_k
 
@@ -59,7 +75,7 @@ def search_manual(
                             chunk_id,
                             source_file,
                             chunk_type,
-                            concat_ws(' > ', NULLIF(h1, ''), NULLIF(h2, ''), NULLIF(h3, ''), NULLIF(h4, ''), NULLIF(h5, '')) AS chapter_path,
+                            chapter_path,
                             content,
                             1 - (embedding <=> %(vec)s::vector) AS cosine_similarity,
                             ROW_NUMBER() OVER (ORDER BY embedding <=> %(vec)s::vector) AS rank_vec
@@ -73,7 +89,7 @@ def search_manual(
                             chunk_id,
                             source_file,
                             chunk_type,
-                            concat_ws(' > ', NULLIF(h1, ''), NULLIF(h2, ''), NULLIF(h3, ''), NULLIF(h4, ''), NULLIF(h5, '')) AS chapter_path,
+                            chapter_path,
                             content,
                             1 - (embedding <=> %(vec)s::vector) AS cosine_similarity,
                             ts_rank(tsv, plainto_tsquery('english', %(query)s)) AS bm25_score,
@@ -142,7 +158,7 @@ def search_manual(
                         chunk_id,
                         source_file,
                         chunk_type,
-                        concat_ws(' > ', NULLIF(h1, ''), NULLIF(h2, ''), NULLIF(h3, ''), NULLIF(h4, ''), NULLIF(h5, '')) AS chapter_path,
+                        chapter_path,
                         content,
                         1 - (embedding <=> %(vec)s::vector) AS cosine_similarity,
                         NULL AS rank_vec,

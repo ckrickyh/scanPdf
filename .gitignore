@@ -1,32 +1,24 @@
-# Python-generated files
+# Python bytecode & cache
 __pycache__/
 *.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
 
-# Virtual environments
+# Virtual environment (uv)
 .venv/
 
-# Environment variables & secrets (極重要：防止金鑰外洩)
+# Environment variables & secrets (API 金鑰與資料庫連線)
 .env
 .env.*
 !.env.example
 
-# Deployment artifacts
+# Deployment artifacts (Hugging Face Space 暫存)
 .deploy_space/
 
-# Output & cache files
+# UI & Runtime artifacts (Gradio 執行快取)
+flagged/
+.gradio/
+
+# PDF OCR extraction & intermediate files (大量圖檔與中介檔)
 output/
-.cache/
 
-# Operating System files
+# macOS system file
 .DS_Store
-Thumbs.db
-
-# IDE & Editor configs
-.vscode/
-.idea/
-*.swp
- 

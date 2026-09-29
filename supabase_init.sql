@@ -13,15 +13,11 @@ CREATE TABLE IF NOT EXISTS manual_chunks (
     source_file VARCHAR(255) NOT NULL,
     chunk_type VARCHAR(20) NOT NULL, -- 'text' 或 'table'
     chunk_index INT NOT NULL,
-    h1 TEXT,
-    h2 TEXT,
-    h3 TEXT,
-    h4 TEXT,
-    h5 TEXT,
+    chapter_path TEXT NOT NULL DEFAULT '未分類章節', -- 完整麵包屑章節路徑（支援 H1~H10+，以 ' / ' 分隔）
     content TEXT NOT NULL,
     embedding vector(1024) NOT NULL, -- 對應 BAAI/bge-m3 輸出之 1024 維度
     tsv tsvector GENERATED ALWAYS AS (
-        setweight(to_tsvector('english', coalesce(h1, '') || ' ' || coalesce(h2, '') || ' ' || coalesce(h3, '') || ' ' || coalesce(h4, '') || ' ' || coalesce(h5, '')), 'A') ||
+        setweight(to_tsvector('english', coalesce(chapter_path, '')), 'A') ||
         setweight(to_tsvector('english', coalesce(content, '')), 'B')
     ) STORED,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
